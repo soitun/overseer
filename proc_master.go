@@ -18,11 +18,13 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/jpillora/overseer/opanic"
 )
 
 var tmpBinPath = filepath.Join(os.TempDir(), "overseer-"+token()+extension())
 
-//a overseer master process
+// a overseer master process
 type master struct {
 	*Config
 	slaveID             int
@@ -39,6 +41,7 @@ type master struct {
 	descriptorsReleased chan bool
 	signalledAt         time.Time
 	printCheckUpdate    bool
+	pendingRestart      bool
 }
 
 func (mp *master) run() error {
@@ -118,17 +121,28 @@ func (mp *master) handleSignal(s os.Signal) {
 	if s == mp.RestartSignal {
 		//user initiated manual restart
 		go mp.triggerRestart()
-	} else if s.String() == "child exited" {
+		return
+	}
+	if s.String() == "child exited" {
 		// will occur on every restart, ignore it
-	} else
+		return
+	}
 	//**during a restart** a SIGUSR1 signals
 	//to the master process that, the file
 	//descriptors have been released
-	if mp.awaitingUSR1 && s == SIGUSR1 {
-		mp.debugf("signaled, sockets ready")
-		mp.awaitingUSR1 = false
-		mp.descriptorsReleased <- true
-	} else
+	if s == SIGUSR1 {
+		mp.restartMux.Lock()
+		awaiting := mp.awaitingUSR1
+		if awaiting {
+			mp.awaitingUSR1 = false
+		}
+		mp.restartMux.Unlock()
+		if awaiting {
+			mp.debugf("signaled, sockets ready")
+			mp.descriptorsReleased <- true
+			return
+		}
+	}
 	//while the slave process is running, proxy
 	//all signals through
 	if mp.slaveCmd != nil && mp.slaveCmd.Process != nil {
@@ -176,13 +190,19 @@ func (mp *master) retreiveFileDescriptors() error {
 	return nil
 }
 
-//fetchLoop is run in a goroutine
+// fetchLoop is run in a goroutine
 func (mp *master) fetchLoop() {
 	min := mp.Config.MinFetchInterval
 	time.Sleep(min)
 	for {
 		t0 := time.Now()
 		mp.fetch()
+		mp.restartMux.Lock()
+		retry := mp.pendingRestart && !mp.restarting
+		mp.restartMux.Unlock()
+		if retry {
+			mp.tryRestart()
+		}
 		//duration fetch of fetch
 		diff := time.Now().Sub(t0)
 		if diff < min {
@@ -195,7 +215,10 @@ func (mp *master) fetchLoop() {
 }
 
 func (mp *master) fetch() {
-	if mp.restarting {
+	mp.restartMux.Lock()
+	restarting := mp.restarting
+	mp.restartMux.Unlock()
+	if restarting {
 		return //skip if restarting
 	}
 	if mp.printCheckUpdate {
@@ -301,24 +324,53 @@ func (mp *master) fetch() {
 	mp.binHash = newHash
 	//binary successfully replaced
 	if !mp.Config.NoRestartAfterFetch {
-		mp.triggerRestart()
+		mp.tryRestart()
 	}
 	//and keep fetching...
 	return
 }
 
+// tryRestart is the auto-restart path invoked from the fetch loop; it
+// consults Config.ShouldRestart and defers if the predicate returns false.
+func (mp *master) tryRestart() {
+	mp.startRestart(true)
+}
+
+// triggerRestart is the manual-restart path invoked from the signal handler
+// and the exported Restart() function; it bypasses Config.ShouldRestart.
 func (mp *master) triggerRestart() {
+	mp.startRestart(false)
+}
+
+// startRestart atomically claims ownership of the restart and, if claimed,
+// performs the graceful shutdown handshake. When checkShouldRestart is true
+// the caller is the fetch loop and ShouldRestart may defer the restart.
+func (mp *master) startRestart(checkShouldRestart bool) {
+	mp.restartMux.Lock()
 	if mp.restarting {
 		mp.debugf("already graceful restarting")
-		return //skip
-	} else if mp.slaveCmd == nil || mp.restarting {
-		mp.debugf("no slave process")
-		return //skip
+		mp.restartMux.Unlock()
+		return
 	}
-	mp.debugf("graceful restart triggered")
+	if checkShouldRestart && mp.Config.ShouldRestart != nil && !mp.Config.ShouldRestart() {
+		if !mp.pendingRestart {
+			mp.debugf("restart deferred: ShouldRestart returned false")
+		}
+		mp.pendingRestart = true
+		mp.restartMux.Unlock()
+		return
+	}
+	mp.pendingRestart = false
+	if mp.slaveCmd == nil {
+		mp.debugf("no slave process")
+		mp.restartMux.Unlock()
+		return
+	}
 	mp.restarting = true
 	mp.awaitingUSR1 = true
 	mp.signalledAt = time.Now()
+	mp.restartMux.Unlock()
+	mp.debugf("graceful restart triggered")
 	mp.sendSignal(mp.Config.RestartSignal) //ask nicely to terminate
 	select {
 	case <-mp.restarted:
@@ -331,7 +383,7 @@ func (mp *master) triggerRestart() {
 	}
 }
 
-//not a real fork
+// not a real fork
 func (mp *master) forkLoop() error {
 	//loop, restart command
 	for {
@@ -360,16 +412,31 @@ func (mp *master) fork() error {
 	cmd.Args = os.Args
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	var stderrTail *opanic.TailWriter
+	if mp.Config.OnPanic != nil {
+		size := mp.Config.StderrTailSize
+		if size <= 0 {
+			size = opanic.DefaultTailSize
+		}
+		stderrTail = opanic.NewTailWriter(size)
+		cmd.Stderr = io.MultiWriter(os.Stderr, stderrTail)
+	} else {
+		cmd.Stderr = os.Stderr
+	}
 	//include socket files
 	cmd.ExtraFiles = mp.slaveExtraFiles
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("Failed to start slave process: %s", err)
 	}
 	//was scheduled to restart, notify success
-	if mp.restarting {
+	mp.restartMux.Lock()
+	wasRestarting := mp.restarting
+	if wasRestarting {
 		mp.restartedAt = time.Now()
 		mp.restarting = false
+	}
+	mp.restartMux.Unlock()
+	if wasRestarting {
 		mp.restarted <- true
 	}
 	//convert wait into channel
@@ -392,10 +459,18 @@ func (mp *master) fork() error {
 			}
 		}
 		mp.debugf("prog exited with %d", code)
+		if stderrTail != nil && mp.Config.OnPanic != nil {
+			if snap := opanic.Scan(stderrTail.Bytes(), mp.debugf); snap != nil {
+				go mp.Config.OnPanic(snap)
+			}
+		}
 		//if a restarts are disabled or if it was an
 		//unexpected crash, proxy this exit straight
 		//through to the main process
-		if mp.NoRestart || !mp.restarting {
+		mp.restartMux.Lock()
+		restarting := mp.restarting
+		mp.restartMux.Unlock()
+		if mp.NoRestart || !restarting {
 			os.Exit(code)
 		}
 	case <-mp.descriptorsReleased:

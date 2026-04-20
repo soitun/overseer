@@ -1,0 +1,17 @@
+SIGABRT: abort
+PC=0xa17ec m=0 sigcode=0
+signal arrived during cgo execution
+
+goroutine 1 [syscall]:
+runtime.cgocall(0x1234567, 0xabcdef)
+	/usr/local/go/src/runtime/cgocall.go:167 +0x3c fp=0x1000 sp=0x800
+main.doWork()
+	/home/user/main.go:10 +0x20
+main.main()
+	/home/user/main.go:6 +0x15
+
+goroutine 2 [running]:
+net/http.(*Transport).dialConn(0xabcd)
+	/usr/local/go/src/net/http/transport.go:1994 +0x109c
+created by net/http.(*Transport).dialConnFor in goroutine 1
+	/usr/local/go/src/net/http/transport.go:1500 +0x200
