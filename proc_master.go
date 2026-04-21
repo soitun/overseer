@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -127,6 +128,13 @@ func (mp *master) handleSignal(s os.Signal) {
 		// will occur on every restart, ignore it
 		return
 	}
+	// Since Go 1.14 the runtime uses SIGURG to preempt goroutines; it is
+	// delivered to the master continuously and must not be proxied. Once
+	// the worker exits, forwarding it races with cmdwait and the failure
+	// path used to os.Exit(1), skipping OnPanic and masking the real code.
+	if s.String() == "urgent I/O condition" {
+		return
+	}
 	//**during a restart** a SIGUSR1 signals
 	//to the master process that, the file
 	//descriptors have been released
@@ -159,11 +167,17 @@ func (mp *master) handleSignal(s os.Signal) {
 }
 
 func (mp *master) sendSignal(s os.Signal) {
-	if mp.workerCmd != nil && mp.workerCmd.Process != nil {
-		if err := mp.workerCmd.Process.Signal(s); err != nil {
-			mp.debugf("signal failed (%s), assuming worker process died unexpectedly", err)
-			os.Exit(1)
+	if mp.workerCmd == nil || mp.workerCmd.Process == nil {
+		return
+	}
+	if err := mp.workerCmd.Process.Signal(s); err != nil {
+		// A worker that has just exited is the expected state right before
+		// cmdwait runs; short-circuiting with os.Exit(1) here skips OnPanic
+		// and overwrites the worker's real exit code.
+		if errors.Is(err, os.ErrProcessDone) {
+			return
 		}
+		mp.debugf("signal failed (%s)", err)
 	}
 }
 
