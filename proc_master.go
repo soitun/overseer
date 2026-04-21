@@ -27,9 +27,9 @@ var tmpBinPath = filepath.Join(os.TempDir(), "overseer-"+token()+extension())
 // a overseer master process
 type master struct {
 	*Config
-	slaveID             int
-	slaveCmd            *exec.Cmd
-	slaveExtraFiles     []*os.File
+	workerID            int
+	workerCmd           *exec.Cmd
+	workerExtraFiles    []*os.File
 	binPath, tmpBinPath string
 	binPerms            os.FileMode
 	binHash             []byte
@@ -143,32 +143,32 @@ func (mp *master) handleSignal(s os.Signal) {
 			return
 		}
 	}
-	//while the slave process is running, proxy
+	//while the worker process is running, proxy
 	//all signals through
-	if mp.slaveCmd != nil && mp.slaveCmd.Process != nil {
+	if mp.workerCmd != nil && mp.workerCmd.Process != nil {
 		mp.debugf("proxy signal (%s)", s)
 		mp.sendSignal(s)
 	} else
 	//otherwise if not running, kill on CTRL+c
 	if s == os.Interrupt {
-		mp.debugf("interupt with no slave")
+		mp.debugf("interupt with no worker")
 		os.Exit(1)
 	} else {
-		mp.debugf("signal discarded (%s), no slave process", s)
+		mp.debugf("signal discarded (%s), no worker process", s)
 	}
 }
 
 func (mp *master) sendSignal(s os.Signal) {
-	if mp.slaveCmd != nil && mp.slaveCmd.Process != nil {
-		if err := mp.slaveCmd.Process.Signal(s); err != nil {
-			mp.debugf("signal failed (%s), assuming slave process died unexpectedly", err)
+	if mp.workerCmd != nil && mp.workerCmd.Process != nil {
+		if err := mp.workerCmd.Process.Signal(s); err != nil {
+			mp.debugf("signal failed (%s), assuming worker process died unexpectedly", err)
 			os.Exit(1)
 		}
 	}
 }
 
 func (mp *master) retreiveFileDescriptors() error {
-	mp.slaveExtraFiles = make([]*os.File, len(mp.Config.Addresses))
+	mp.workerExtraFiles = make([]*os.File, len(mp.Config.Addresses))
 	for i, addr := range mp.Config.Addresses {
 		a, err := net.ResolveTCPAddr("tcp", addr)
 		if err != nil {
@@ -185,7 +185,7 @@ func (mp *master) retreiveFileDescriptors() error {
 		if err := l.Close(); err != nil {
 			return fmt.Errorf("Failed to close listener for: %s (%s)", addr, err)
 		}
-		mp.slaveExtraFiles[i] = f
+		mp.workerExtraFiles[i] = f
 	}
 	return nil
 }
@@ -361,8 +361,8 @@ func (mp *master) startRestart(checkShouldRestart bool) {
 		return
 	}
 	mp.pendingRestart = false
-	if mp.slaveCmd == nil {
-		mp.debugf("no slave process")
+	if mp.workerCmd == nil {
+		mp.debugf("no worker process")
 		mp.restartMux.Unlock()
 		return
 	}
@@ -396,17 +396,22 @@ func (mp *master) forkLoop() error {
 func (mp *master) fork() error {
 	mp.debugf("starting %s", mp.binPath)
 	cmd := exec.Command(mp.binPath)
-	//mark this new process as the "active" slave process.
+	//mark this new process as the "active" worker process.
 	//this process is assumed to be holding the socket files.
-	mp.slaveCmd = cmd
-	mp.slaveID++
-	//provide the slave process with some state
+	mp.workerCmd = cmd
+	mp.workerID++
+	//provide the worker process with some state. Set both the new
+	//OVERSEER_WORKER_* and legacy OVERSEER_SLAVE_* names so a pre-rename
+	//child binary forked by a post-rename master still detects itself as a
+	//worker and reads its id.
 	e := os.Environ()
 	e = append(e, envBinID+"="+hex.EncodeToString(mp.binHash))
 	e = append(e, envBinPath+"="+mp.binPath)
-	e = append(e, envSlaveID+"="+strconv.Itoa(mp.slaveID))
+	e = append(e, envWorkerID+"="+strconv.Itoa(mp.workerID))
+	e = append(e, envIsWorker+"=1")
+	e = append(e, envSlaveID+"="+strconv.Itoa(mp.workerID))
 	e = append(e, envIsSlave+"=1")
-	e = append(e, envNumFDs+"="+strconv.Itoa(len(mp.slaveExtraFiles)))
+	e = append(e, envNumFDs+"="+strconv.Itoa(len(mp.workerExtraFiles)))
 	cmd.Env = e
 	//inherit master args/stdfiles
 	cmd.Args = os.Args
@@ -424,9 +429,9 @@ func (mp *master) fork() error {
 		cmd.Stderr = os.Stderr
 	}
 	//include socket files
-	cmd.ExtraFiles = mp.slaveExtraFiles
+	cmd.ExtraFiles = mp.workerExtraFiles
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("Failed to start slave process: %s", err)
+		return fmt.Errorf("Failed to start worker process: %s", err)
 	}
 	//was scheduled to restart, notify success
 	mp.restartMux.Lock()
@@ -461,7 +466,22 @@ func (mp *master) fork() error {
 		mp.debugf("prog exited with %d", code)
 		if stderrTail != nil && mp.Config.OnPanic != nil {
 			if snap := opanic.Scan(stderrTail.Bytes(), mp.debugf); snap != nil {
-				go mp.Config.OnPanic(snap)
+				// Run synchronously with a bounded deadline: os.Exit below
+				// does not wait for goroutines, so a bare `go` would race
+				// with termination and the callback would silently drop on
+				// a loaded master. Cap the wait on Config.TerminateTimeout
+				// (the existing shutdown budget) so a buggy callback cannot
+				// stall shutdown.
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					mp.Config.OnPanic(snap)
+				}()
+				select {
+				case <-done:
+				case <-time.After(mp.Config.TerminateTimeout):
+					mp.warnf("OnPanic callback exceeded %s; continuing shutdown", mp.Config.TerminateTimeout)
+				}
 			}
 		}
 		//if a restarts are disabled or if it was an

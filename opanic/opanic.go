@@ -1,4 +1,4 @@
-// Package opanic detects Go panics and runtime crashes from a slave
+// Package opanic detects Go panics and runtime crashes from a worker
 // process's stderr and parses them into a structured goroutine snapshot
 // via github.com/maruel/panicparse.
 package opanic

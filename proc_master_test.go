@@ -7,8 +7,8 @@ import (
 
 func TestTryRestart_ShouldRestartNil_TriggersRestart(t *testing.T) {
 	mp := &master{Config: &Config{}}
-	// slaveCmd is nil so triggerRestart returns immediately; we just verify
-	// the tryRestart path doesn't set pendingRestart.
+	// workerCmd is nil so triggerRestart returns immediately; we just
+	// verify the tryRestart path doesn't set pendingRestart.
 	mp.tryRestart()
 	if mp.pendingRestart {
 		t.Fatal("expected pendingRestart=false when ShouldRestart is nil")
@@ -82,7 +82,7 @@ func TestTriggerRestart_BypassesShouldRestart(t *testing.T) {
 		ShouldRestart: func() bool { called = true; return false },
 	}}
 	mp.pendingRestart = true
-	mp.triggerRestart() //slaveCmd nil so no actual restart work happens
+	mp.triggerRestart() //workerCmd nil so no actual restart work happens
 	if called {
 		t.Fatal("ShouldRestart must not be consulted by the manual path")
 	}

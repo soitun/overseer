@@ -55,7 +55,7 @@ type Win32_Process struct {
 	WorkingSetSize        uint64
 }
 
-func (sp *slave) watchParent() error {
+func (sp *worker) watchParent() error {
 	sp.masterPid = os.Getppid()
 	proc, err := os.FindProcess(sp.masterPid)
 	if err != nil {

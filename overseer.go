@@ -15,6 +15,11 @@ import (
 )
 
 const (
+	envWorkerID = "OVERSEER_WORKER_ID"
+	envIsWorker = "OVERSEER_IS_WORKER"
+	// Deprecated: legacy names from before the slave→worker rename. Still
+	// set by new masters and honored by new workers so rolling upgrades
+	// across the rename boundary work in either direction.
 	envSlaveID        = "OVERSEER_SLAVE_ID"
 	envIsSlave        = "OVERSEER_IS_SLAVE"
 	envNumFDs         = "OVERSEER_NUM_FDS"
@@ -66,12 +71,13 @@ type Config struct {
 	//subsequent fetch loop iteration until it returns true. Manual restarts
 	//via overseer.Restart() bypass this check.
 	ShouldRestart func() bool
-	//OnPanic, when non-nil, is invoked after the slave process exits if a
+	//OnPanic, when non-nil, is invoked after the worker process exits if a
 	//Go panic/runtime crash is detected in its stderr. The snapshot is
 	//parsed by panicparse and contains the crashing goroutines. The
-	//callback runs in its own goroutine and must not block shutdown.
+	//callback is awaited before the master exits, bounded by
+	//TerminateTimeout so a slow or buggy callback cannot stall shutdown.
 	OnPanic func(*opanic.Snapshot)
-	//StderrTailSize is the number of bytes of slave stderr retained in
+	//StderrTailSize is the number of bytes of worker stderr retained in
 	//memory for panic detection. Only used when OnPanic is set. Defaults
 	//to 256 KiB.
 	StderrTailSize int
@@ -152,7 +158,7 @@ func SanityCheck() {
 	}
 }
 
-// abstraction over master/slave
+// abstraction over master/worker
 var currentProcess interface {
 	triggerRestart()
 	run() error
@@ -169,9 +175,11 @@ func runErr(c *Config) error {
 	if sanityCheck() {
 		return nil
 	}
-	//run either in master or slave mode
-	if os.Getenv(envIsSlave) == "1" {
-		currentProcess = &slave{Config: c}
+	//run either in master or worker mode. Accept either the new
+	//OVERSEER_IS_WORKER or legacy OVERSEER_IS_SLAVE so a new binary can be
+	//forked by an old master (and vice versa) during upgrades.
+	if os.Getenv(envIsWorker) == "1" || os.Getenv(envIsSlave) == "1" {
+		currentProcess = &worker{Config: c}
 	} else {
 		currentProcess = &master{Config: c}
 	}

@@ -44,9 +44,9 @@ type State struct {
 	BinPath string
 }
 
-//a overseer slave process
+//a overseer worker process
 
-type slave struct {
+type worker struct {
 	*Config
 	id         string
 	listeners  []*overseerListener
@@ -55,8 +55,14 @@ type slave struct {
 	state      State
 }
 
-func (sp *slave) run() error {
-	sp.id = os.Getenv(envSlaveID)
+func (sp *worker) run() error {
+	// Prefer the new env var; fall back to the legacy OVERSEER_SLAVE_ID so a
+	// worker forked by a pre-rename master still gets its id.
+	if id := os.Getenv(envWorkerID); id != "" {
+		sp.id = id
+	} else {
+		sp.id = os.Getenv(envSlaveID)
+	}
 	sp.debugf("run")
 	sp.state.Enabled = true
 	sp.state.ID = os.Getenv(envBinID)
@@ -78,7 +84,7 @@ func (sp *slave) run() error {
 	return nil
 }
 
-func (sp *slave) initFileDescriptors() error {
+func (sp *worker) initFileDescriptors() error {
 	//inspect file descriptors
 	numFDs, err := strconv.Atoi(os.Getenv(envNumFDs))
 	if err != nil {
@@ -102,7 +108,7 @@ func (sp *slave) initFileDescriptors() error {
 	return nil
 }
 
-func (sp *slave) watchSignal() {
+func (sp *worker) watchSignal() {
 	signals := make(chan os.Signal)
 	signal.Notify(signals, sp.Config.RestartSignal)
 	go func() {
@@ -134,20 +140,20 @@ func (sp *slave) watchSignal() {
 	}()
 }
 
-func (sp *slave) triggerRestart() {
+func (sp *worker) triggerRestart() {
 	if err := sp.masterProc.Signal(sp.Config.RestartSignal); err != nil {
 		os.Exit(1)
 	}
 }
 
-func (sp *slave) debugf(f string, args ...interface{}) {
+func (sp *worker) debugf(f string, args ...interface{}) {
 	if sp.Config.Debug {
-		log.Printf("[overseer slave#"+sp.id+"] "+f, args...)
+		log.Printf("[overseer worker#"+sp.id+"] "+f, args...)
 	}
 }
 
-func (sp *slave) warnf(f string, args ...interface{}) {
+func (sp *worker) warnf(f string, args ...interface{}) {
 	if sp.Config.Debug || !sp.Config.NoWarn {
-		log.Printf("[overseer slave#"+sp.id+"] "+f, args...)
+		log.Printf("[overseer worker#"+sp.id+"] "+f, args...)
 	}
 }
