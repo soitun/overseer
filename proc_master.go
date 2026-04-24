@@ -29,7 +29,9 @@ var tmpBinPath = filepath.Join(os.TempDir(), "overseer-"+token()+extension())
 type master struct {
 	*Config
 	workerID            int
+	workerMux           sync.Mutex
 	workerCmd           *exec.Cmd
+	pendingSignals      []os.Signal
 	workerExtraFiles    []*os.File
 	binPath, tmpBinPath string
 	binPerms            os.FileMode
@@ -151,12 +153,26 @@ func (mp *master) handleSignal(s os.Signal) {
 			return
 		}
 	}
-	//while the worker process is running, proxy
-	//all signals through
-	if mp.workerCmd != nil && mp.workerCmd.Process != nil {
+	//while the worker process is running, proxy all signals through.
+	//during the fork window (workerCmd set but cmd.Start() not yet
+	//returned, so Process is still nil), queue the signal — fork() will
+	//drain pendingSignals once Start succeeds. Without this, a signal
+	//racing a fresh fork is silently dropped and the new worker never
+	//learns systemd wants it dead, hanging unit stop until SIGKILL.
+	mp.workerMux.Lock()
+	if mp.workerCmd != nil && mp.workerCmd.Process == nil {
+		mp.pendingSignals = append(mp.pendingSignals, s)
+		mp.workerMux.Unlock()
+		mp.debugf("signal queued (%s), worker starting", s)
+		return
+	}
+	hasWorker := mp.workerCmd != nil && mp.workerCmd.Process != nil
+	mp.workerMux.Unlock()
+	if hasWorker {
 		mp.debugf("proxy signal (%s)", s)
 		mp.sendSignal(s)
-	} else
+		return
+	}
 	//otherwise if not running, kill on CTRL+c
 	if s == os.Interrupt {
 		mp.debugf("interupt with no worker")
@@ -167,10 +183,16 @@ func (mp *master) handleSignal(s os.Signal) {
 }
 
 func (mp *master) sendSignal(s os.Signal) {
-	if mp.workerCmd == nil || mp.workerCmd.Process == nil {
+	mp.workerMux.Lock()
+	proc := (*os.Process)(nil)
+	if mp.workerCmd != nil {
+		proc = mp.workerCmd.Process
+	}
+	mp.workerMux.Unlock()
+	if proc == nil {
 		return
 	}
-	if err := mp.workerCmd.Process.Signal(s); err != nil {
+	if err := proc.Signal(s); err != nil {
 		// A worker that has just exited is the expected state right before
 		// cmdwait runs; short-circuiting with os.Exit(1) here skips OnPanic
 		// and overwrites the worker's real exit code.
@@ -412,7 +434,13 @@ func (mp *master) fork() error {
 	cmd := exec.Command(mp.binPath)
 	//mark this new process as the "active" worker process.
 	//this process is assumed to be holding the socket files.
+	//workerCmd is set before cmd.Start() so handleSignal can see a fork
+	//is in progress (Process still nil) and queue signals instead of
+	//dropping them; those queued signals are delivered below once Start
+	//succeeds.
+	mp.workerMux.Lock()
 	mp.workerCmd = cmd
+	mp.workerMux.Unlock()
 	mp.workerID++
 	//provide the worker process with some state. Set both the new
 	//OVERSEER_WORKER_* and legacy OVERSEER_SLAVE_* names so a pre-rename
@@ -445,7 +473,22 @@ func (mp *master) fork() error {
 	//include socket files
 	cmd.ExtraFiles = mp.workerExtraFiles
 	if err := cmd.Start(); err != nil {
+		mp.workerMux.Lock()
+		mp.workerCmd = nil
+		mp.pendingSignals = nil
+		mp.workerMux.Unlock()
 		return fmt.Errorf("Failed to start worker process: %s", err)
+	}
+	//drain any signals that arrived during the fork window
+	mp.workerMux.Lock()
+	pending := mp.pendingSignals
+	mp.pendingSignals = nil
+	mp.workerMux.Unlock()
+	for _, s := range pending {
+		mp.debugf("delivering queued signal (%s)", s)
+		if err := cmd.Process.Signal(s); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			mp.debugf("queued signal failed (%s)", err)
+		}
 	}
 	//was scheduled to restart, notify success
 	mp.restartMux.Lock()
