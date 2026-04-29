@@ -4,6 +4,7 @@ import (
 	"io"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,7 +14,11 @@ import (
 // returns the resulting binary path.
 func buildPanicker(t *testing.T) string {
 	t.Helper()
-	out := filepath.Join(t.TempDir(), "panicker")
+	name := "panicker"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	out := filepath.Join(t.TempDir(), name)
 	cmd := exec.Command("go", "build", "-o", out, "./testdata/panicker")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build panicker failed: %s\n%s", err, output)
